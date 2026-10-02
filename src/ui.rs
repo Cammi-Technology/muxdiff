@@ -4,11 +4,13 @@
 //! Colours come from a palette file when `MUXDIFF_PALETTE` names one (a
 //! colors.toml in Omarchy's format: `accent = "#7aa2f7"`, `red`, `green`,
 //! `background`, `foreground`, `selection`), falling back to the terminal's own.
+//! Without one, the background is asked of the terminal, so the added and
+//! removed lines are still tinted.
 
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -41,6 +43,45 @@ pub fn theme(key: &str, fallback: Color) -> Color {
         *cached = Some((Instant::now(), colours));
     }
     cached.as_ref().and_then(|(_, colours)| colours.get(key).copied()).unwrap_or(fallback)
+}
+
+static TERMINAL_BACKGROUND: OnceLock<Option<Color>> = OnceLock::new();
+
+/// The terminal's background colour, asked with OSC 11 (tmux answers for its
+/// pane), or None when it doesn't say within a moment. Asked once, before the
+/// screen starts, so the answer isn't read as keys.
+fn ask_background() -> Option<Color> {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    let mut tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty").ok()?;
+    enable_raw_mode().ok()?;
+    let answer = (|| {
+        tty.write_all(b"\x1b]11;?\x1b\\").ok()?;
+        tty.flush().ok()?;
+        let mut answer = vec![];
+        let mut byte = [0u8; 1];
+        // until the answer ends (BEL or ST), giving up after 100ms of silence
+        while !answer.ends_with(b"\x07") && !answer.ends_with(b"\x1b\\") {
+            let mut poll = libc::pollfd { fd: tty.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            if unsafe { libc::poll(&mut poll, 1, 100) } <= 0 || tty.read(&mut byte).ok()? == 0 {
+                return None;
+            }
+            answer.push(byte[0]);
+        }
+        Some(String::from_utf8_lossy(&answer).to_string())
+    })();
+    ratatui::crossterm::terminal::disable_raw_mode().ok();
+    // "\e]11;rgb:1a1a/1b1b/2626\e\\": the first two digits of each are enough
+    let rgb = answer?.split("rgb:").nth(1)?.to_string();
+    let parts: Vec<u8> = rgb.split('/').take(3).filter_map(|part| u8::from_str_radix(part.get(..2)?, 16).ok()).collect();
+    let [r, g, b] = parts[..] else { return None };
+    Some(Color::Rgb(r, g, b))
+}
+
+/// The background, from the palette or else the terminal: Reset when neither says.
+pub fn background() -> Color {
+    let terminal = TERMINAL_BACKGROUND.get_or_init(ask_background).unwrap_or(Color::Reset);
+    theme("background", terminal)
 }
 
 pub fn accent() -> Color {
@@ -155,8 +196,9 @@ pub fn leave(what: impl FnOnce()) {
 /// Draw the frame and give back the space inside it.
 ///   title  top left, bold
 ///   note   after the title, dim
+///   alert  along the bottom, before the keys and bold: what the last key did
 ///   keys   along the bottom: "↑↓ move · Enter choose · q close"
-pub fn page(frame: &mut Frame, title: &str, note: &str, keys: &str) -> Rect {
+pub fn page(frame: &mut Frame, title: &str, note: &str, alert: &str, keys: &str) -> Rect {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(dim())
@@ -165,7 +207,10 @@ pub fn page(frame: &mut Frame, title: &str, note: &str, keys: &str) -> Rect {
             Span::styled(format!(" {title} "), bold().fg(accent())),
             Span::styled(if note.is_empty() { String::new() } else { format!("{note} ") }, dim()),
         ]))
-        .title_bottom(Line::styled(format!(" {keys} "), dim()));
+        .title_bottom(Line::from(vec![
+            Span::styled(if alert.is_empty() { String::new() } else { format!(" {alert} ") }, bold().fg(accent())),
+            Span::styled(format!(" {keys} "), dim()),
+        ]));
     let inside = block.inner(frame.area());
     frame.render_widget(block, frame.area());
     inside
