@@ -540,9 +540,10 @@ impl Muxdiff {
     /// The rows from the files: a header each, and the hunks of the open ones.
     fn list(&mut self) {
         self.colour_open_files();
-        let background = theme("background", Color::Reset);
-        let added_tint = mix(background, green(), 18);
-        let removed_tint = mix(background, red(), 18);
+        let background = background();
+        // the palette's green and red, or a plain pair to tint the terminal's background with
+        let added_tint = mix(background, theme("green", Color::Rgb(0x3f, 0xb9, 0x50)), 18);
+        let removed_tint = mix(background, theme("red", Color::Rgb(0xf8, 0x51, 0x49)), 18);
         let divider = mix(background, theme("foreground", Color::Reset), 10); // a band behind each hunk's "@@" line
         let mut rows = vec![];
         let mut lines = vec![];
@@ -909,7 +910,7 @@ impl Muxdiff {
         let pr = pull_request(&self.root, Some(number)).ok_or(format!("#{number} is closed, or gh can't see it"))?;
         let theirs = parse(&gh(&self.root, &["pr", "diff", &number.to_string(), "--color=never"])?);
         let label = self.label(picked);
-        let not_in = format!("{label} is not in #{number}'s diff: commit and push it first");
+        let not_in = format!("{label} is not in #{number}'s diff: {}", self.out_of_step(number, &pr.head));
         let f = match picked { Picked::File(f) | Picked::Lines(f, _) => *f };
         let file = &self.files[f];
         let their_file = theirs.iter().find(|theirs| theirs.path == file.path).ok_or(not_in.clone())?;
@@ -942,6 +943,28 @@ impl Muxdiff {
     }
 
     /// c, after a comment: post it on its own.
+    /// Why a line may not be in the pull request's diff: this checkout and
+    /// the pull request are at different commits, or the line isn't committed.
+    fn out_of_step(&self, number: u64, head: &str) -> String {
+        let git = |args: &[&str]| run("git", &[&["-C", &self.root][..], args].concat());
+        let here = git(&["rev-parse", "HEAD"]);
+        if here == head {
+            return "commit and push it first".into();
+        }
+        let commits = |n: String| if n == "1" { "1 commit".to_string() } else { format!("{n} commits") };
+        let known = ok("git", &["-C", &self.root, "cat-file", "-e", &format!("{head}^{{commit}}")]);
+        if !known || ok("git", &["-C", &self.root, "merge-base", "--is-ancestor", "HEAD", head]) {
+            return match known {
+                true => format!("this checkout is {} behind #{number}: pull first", commits(git(&["rev-list", "--count", &format!("HEAD..{head}")]))),
+                false => format!("#{number} has commits this checkout hasn't fetched: pull first"),
+            };
+        }
+        if ok("git", &["-C", &self.root, "merge-base", "--is-ancestor", head, "HEAD"]) {
+            return format!("{} here aren't pushed: push first", commits(git(&["rev-list", "--count", &format!("{head}..HEAD")])));
+        }
+        format!("this checkout and #{number} have gone different ways: pull or push first")
+    }
+
     fn post_comment(&mut self, comment: Comment, body: String) {
         self.note = match post(&self.root, &comment, body.trim()) {
             Ok(()) => format!("commented on #{} at {}", comment.pr, comment.label),
@@ -1071,9 +1094,6 @@ impl App for Muxdiff {
         if let (Some(_), Some(Picked::Lines(_, lines))) = (self.anchor, self.picked()) {
             note.push_str(&match lines.len() { 1 => " · 1 line".to_string(), n => format!(" · {n} lines") });
         }
-        if !self.note.is_empty() {
-            note.push_str(&format!(" · {}", self.note));
-        }
         let tmux = if self.in_tmux { " · p w pane, window · s AI" } else { "" };
         let comment = match &self.pr {
             Some(pr) if pr.review.is_some() => " · i comment · S submit",
@@ -1093,7 +1113,7 @@ impl App for Muxdiff {
                 if self.base.is_some() { "uncommitted" } else { &self.branch },
             ),
         };
-        let area = page(frame, "muxdiff", &note, &keys);
+        let area = page(frame, "muxdiff", &note, &self.note, &keys);
         self.menu.draw(frame, area);
     }
 
@@ -1224,6 +1244,7 @@ fn main() {
         }
     }
     let cwd = std::env::current_dir().expect("the current folder");
+    background(); // asked of the terminal now, before the screen takes its keys
     let looking_for_pr = {
         let root = root.clone();
         std::thread::spawn(move || pull_request(&root, None))

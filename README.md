@@ -86,7 +86,8 @@ It needs `git`, and uses these when they are there:
 
 ## Colours
 
-By default it uses the terminal's colours. To match a theme, point
+By default it uses the terminal's colours, and tints the added and removed
+lines from the background the terminal reports. To match a theme, point
 `MUXDIFF_PALETTE` at a `colors.toml` in [Omarchy](https://omarchy.org)'s palette
 format:
 
