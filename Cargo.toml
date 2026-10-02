@@ -1,0 +1,17 @@
+[package]
+name = "muxdiff"
+version = "0.1.0"
+edition = "2024"
+description = "A terminal multi-buffer diff that works with the editor and AI agent in your tmux session"
+license = "MIT"
+repository = "https://github.com/Cammi-Technology/muxdiff"
+readme = "README.md"
+keywords = ["git", "diff", "tmux", "tui", "helix"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+ratatui = "0.30"
+ansi-to-tui = "8"
+
+[profile.release]
+strip = true
