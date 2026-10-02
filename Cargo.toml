@@ -12,6 +12,7 @@ categories = ["command-line-utilities", "development-tools"]
 [dependencies]
 ratatui = "0.30"
 ansi-to-tui = "8"
+regex = "1"
 
 [profile.release]
 strip = true
