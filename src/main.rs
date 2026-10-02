@@ -468,7 +468,16 @@ enum Typing {
     Post(Comment, String), // the comment typed, with no review in progress: post it, or start one?
     Summary,               // S: the review's summary
     Verdict(String),       // and then: comment, approve or request changes?
-    Search,                // /
+    Search(Origin),        // /: where it started, to go back to on Esc
+}
+
+/// Where the cursor was when / was pressed: a live search moves on from
+/// there as each key is typed, and Esc goes back.
+struct Origin {
+    row: usize,
+    anchor: Option<usize>,
+    open: Vec<String>,
+    search: Option<(String, Regex)>,
 }
 
 /// What the keys act on: the selection, or else the row under the cursor.
@@ -489,7 +498,7 @@ struct Muxdiff {
     open: Vec<String>,    // the paths whose diffs are shown
     rows: Vec<Row>,
     lines: Vec<Line<'static>>, // the rows as drawn, before the selection is marked on them
-    marked: Option<(usize, usize)>, // the rows the menu has marked as selected
+    painted: Option<(Option<(usize, usize)>, Option<String>)>, // the selection and search the menu's rows show
     menu: Menu,
     in_tmux: bool,
     note: String,         // a word about the last thing done, after the title
@@ -498,6 +507,7 @@ struct Muxdiff {
     extending: bool,      // v: select mode, where moving extends the selection
     g: bool,              // g pressed, waiting for the second key of gg or ge
     search: Option<(String, Regex)>, // what was typed, and the search made of it
+    matches_shown: bool,  // the search's matches highlighted (Esc hides them, n and N show them again)
     pr: Option<Pr>,
     looking_for_pr: Option<JoinHandle<Option<Pr>>>,
 }
@@ -611,7 +621,7 @@ impl Muxdiff {
         }
         self.rows = rows;
         self.lines = lines;
-        self.marked = None;
+        self.painted = None;
         self.menu.set(self.lines.clone());
     }
 
@@ -786,6 +796,7 @@ impl Muxdiff {
             self.note = "nothing searched for yet: /".into();
             return;
         };
+        self.matches_shown = true;
         let here = self.menu.selected()
             .and_then(|at| (0..=at).rev().find_map(|row| self.place(row)))
             .unwrap_or((0, 0, 0));
@@ -1018,6 +1029,44 @@ impl Muxdiff {
         };
     }
 
+    /// /: start a live search from here.
+    fn start_search(&mut self) {
+        let origin = Origin {
+            row: self.menu.selected().unwrap_or(0),
+            anchor: self.anchor,
+            open: self.open.clone(),
+            search: self.search.clone(),
+        };
+        self.typing = Some((Typing::Search(origin), String::new()));
+    }
+
+    /// Back to where / was pressed: the cursor, the selection and the files
+    /// open then, which the search may have opened more of.
+    fn back_to(&mut self, origin: &Origin) {
+        if self.open != origin.open {
+            self.open = origin.open.clone();
+            self.list();
+        }
+        self.menu.select(origin.row);
+        self.anchor = origin.anchor;
+    }
+
+    /// Each key typed after /: from where it started, to the first match of
+    /// what is typed so far. A regex half typed (an open bracket) keeps the
+    /// last whole one's matches.
+    fn live_search(&mut self, origin: &Origin, text: &str) {
+        self.back_to(origin);
+        if text.is_empty() {
+            self.search = origin.search.clone();
+            self.matches_shown = false;
+            return;
+        }
+        if let Ok(search) = search_for(text) {
+            self.search = Some((text.to_string(), search));
+            self.find(true);
+        }
+    }
+
     /// Enter, after typing.
     fn finish(&mut self, typing: Typing, text: String) {
         match typing {
@@ -1025,23 +1074,52 @@ impl Muxdiff {
             Typing::Comment(comment) => self.comment_typed(comment, text),
             Typing::Summary => self.typing = Some((Typing::Verdict(text), String::new())),
             Typing::Post(..) | Typing::Verdict(_) => {} // a key chooses, not Enter
-            Typing::Search => {
-                // an empty search searches again for the last
-                let pattern = match (text.is_empty(), &self.search) {
-                    (true, Some((last, _))) => last.clone(),
-                    (true, None) => return,
-                    (false, _) => text,
-                };
-                match search_for(&pattern) {
-                    Ok(search) => {
-                        self.search = Some((pattern, search));
+            Typing::Search(origin) => {
+                if text.is_empty() {
+                    // an empty search searches again for the last
+                    self.search = origin.search;
+                    if self.search.is_some() {
                         self.find(true);
                     }
-                    Err(_) => self.note = format!("not a regex: {pattern}"),
+                } else if search_for(&text).is_err() {
+                    self.back_to(&origin);
+                    self.search = origin.search;
+                    self.note = format!("not a regex: {text}");
                 }
+                // otherwise the live search is already there
             }
         }
     }
+}
+
+/// Highlight what the search matches in some of a line's spans (the text,
+/// past the gutter), splitting the spans at the matches' edges.
+fn highlight_matches(line: &mut Line<'static>, spans: std::ops::Range<usize>, search: &Regex, style: Style) {
+    let end = spans.end.min(line.spans.len());
+    let start = spans.start.min(end);
+    let text: String = line.spans[start..end].iter().map(|span| span.content.as_ref()).collect();
+    let found: Vec<(usize, usize)> = search.find_iter(&text).map(|m| (m.start(), m.end())).filter(|(a, b)| a < b).collect();
+    if found.is_empty() {
+        return;
+    }
+    let mut out = line.spans[..start].to_vec();
+    let mut at = 0;
+    for span in &line.spans[start..end] {
+        let content = span.content.as_ref();
+        let (from, to) = (at, at + content.len());
+        let mut cuts = vec![from, to];
+        cuts.extend(found.iter().flat_map(|&(a, b)| [a, b]).filter(|&cut| cut > from && cut < to));
+        cuts.sort();
+        cuts.dedup();
+        for pair in cuts.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let hit = found.iter().any(|&(s, e)| s <= a && b <= e);
+            out.push(Span::styled(content[a - from..b - from].to_string(), if hit { span.style.patch(style) } else { span.style }));
+        }
+        at = to;
+    }
+    out.extend(line.spans[end..].iter().cloned());
+    line.spans = out;
 }
 
 /// Show a row as selected: the palette's selection colour behind it, or
@@ -1064,7 +1142,9 @@ impl App for Muxdiff {
             self.pr = lookup.join().ok().flatten();
         }
         let span = self.span();
-        if span != self.marked {
+        let shown = self.search.as_ref().filter(|_| self.matches_shown);
+        let wanted = (span, shown.map(|(pattern, _)| pattern.clone()));
+        if self.painted.as_ref() != Some(&wanted) {
             let mut lines = self.lines.clone();
             if let (Some((first, last)), Some(f)) = (span, self.selected_file()) {
                 let bg = Some(theme("selection", Color::Reset)).filter(|bg| *bg != Color::Reset);
@@ -1072,8 +1152,20 @@ impl App for Muxdiff {
                     mark(&mut lines[row], bg);
                 }
             }
+            if let Some((_, search)) = shown {
+                // the matches as Helix shows them: dark text on yellow
+                let text = match background() { Color::Rgb(r, g, b) => Color::Rgb(r, g, b), _ => Color::Black };
+                let style = Style::new().bg(theme("yellow", Color::Yellow)).fg(text);
+                for (row, line) in lines.iter_mut().enumerate() {
+                    match self.rows[row] {
+                        Row::Header(_) => highlight_matches(line, 1..2, search, style),
+                        Row::Text(..) => highlight_matches(line, 2..usize::MAX, search, style),
+                        _ => {}
+                    }
+                }
+            }
             self.menu.set(lines);
-            self.marked = span;
+            self.painted = Some(wanted);
         }
         let what = match &self.base {
             Some(base) if self.base_title.is_empty() => format!("since {base}"),
@@ -1106,7 +1198,7 @@ impl App for Muxdiff {
             Some((Typing::Post(comment, _), _)) => format!("#{} {}: c comment now · r start a review · Esc cancel", comment.pr, comment.label),
             Some((Typing::Summary, text)) => format!("review of #{}: › {}▏ · Enter next · Alt+Enter new line · Esc cancel", self.pr.as_ref().map_or(0, |pr| pr.number), text.replace('\n', " ⏎ ")),
             Some((Typing::Verdict(_), _)) => "submit the review: c comment · a approve · r request changes · Esc cancel".into(),
-            Some((Typing::Search, text)) => format!("/{text}▏ · Enter find · Esc cancel"),
+            Some((Typing::Search(_), text)) => format!("/{text}▏ · Enter keep · Esc go back"),
             None => format!(
                 "{}x line · v extend · / search · Tab fold · Enter edit{tmux}{comment} · [ ] file · m {} · c C commit · y copy · q close",
                 if self.extending { "SEL · " } else { "" },
@@ -1136,7 +1228,13 @@ impl App for Muxdiff {
         }
         if let Some((typing, text)) = &mut self.typing {
             match key.code {
-                KeyCode::Esc => self.typing = None,
+                KeyCode::Esc => {
+                    if let Some((Typing::Search(origin), _)) = self.typing.take() {
+                        self.back_to(&origin);
+                        self.search = origin.search;
+                        self.matches_shown = false;
+                    }
+                }
                 KeyCode::Enter if alt && matches!(typing, Typing::Comment(_) | Typing::Summary) => text.push('\n'),
                 KeyCode::Enter => {
                     if let Some((typing, text)) = self.typing.take() {
@@ -1146,6 +1244,10 @@ impl App for Muxdiff {
                 KeyCode::Backspace => { text.pop(); }
                 KeyCode::Char(c) => text.push(c),
                 _ => {}
+            }
+            if let Some((Typing::Search(origin), text)) = self.typing.take() {
+                self.live_search(&origin, &text);
+                self.typing = Some((Typing::Search(origin), text));
             }
             return Flow::Go;
         }
@@ -1162,6 +1264,7 @@ impl App for Muxdiff {
         match key.code {
             KeyCode::Esc if self.extending => self.extending = false,
             KeyCode::Esc if self.anchor.is_some() => self.anchor = None,
+            KeyCode::Esc if self.matches_shown => self.matches_shown = false,
             KeyCode::Esc | KeyCode::Char('q') => return Flow::Quit,
             KeyCode::Char('x') => self.select_line(),
             KeyCode::Char('v') => self.extending = !self.extending,
@@ -1173,7 +1276,7 @@ impl App for Muxdiff {
                 }
             }
             KeyCode::Char(';') => self.anchor = None,
-            KeyCode::Char('/') => self.typing = Some((Typing::Search, String::new())),
+            KeyCode::Char('/') => self.start_search(),
             KeyCode::Char('n') => self.find(true),
             KeyCode::Char('N') => self.find(false),
             KeyCode::Char('i') => self.start_comment(),
@@ -1263,7 +1366,8 @@ fn main() {
         open: vec![],
         rows: vec![],
         lines: vec![],
-        marked: None,
+        painted: None,
+        matches_shown: false,
         menu: Menu::new(vec![]),
         in_tmux: std::env::var_os("TMUX").is_some(),
         note: String::new(),

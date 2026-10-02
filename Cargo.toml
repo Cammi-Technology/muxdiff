@@ -1,6 +1,6 @@
 [package]
 name = "muxdiff"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A terminal multi-buffer diff that works with the editor and AI agent in your tmux session"
 license = "MIT"
