@@ -24,8 +24,8 @@ Moving and selecting work as they do in [Helix](https://helix-editor.com).
 | `x` | Select the line (or the hunk, or the file, from its header). Press it again to take in the next line |
 | `v` | Select mode: moving extends the selection |
 | `;` `Alt-;` | Collapse the selection, or flip which end the cursor is on |
-| `Esc` | Leave select mode, then drop the selection, then close |
-| `/` `n` `N` | Search with a regex (case-insensitive unless it has a capital), then go to the next or previous match. Closed files are searched too, and open to show a match |
+| `Esc` | Leave select mode, then drop the selection, then hide the search's highlights, then close |
+| `/` `n` `N` | Search as you type, with a regex (case-insensitive unless it has a capital), highlighting every match. `Enter` keeps the search and `Esc` goes back to where you started. Then `n` and `N` go to the next or previous match. Closed files are searched too, and open to show a match |
 | `Tab` `Space` | Open or close the file under the cursor |
 | `A` | Open or close every file |
 | `Enter` | Open the file at that line in `$EDITOR` (`+line path`, so Helix, Neovim and Vim all work) |
