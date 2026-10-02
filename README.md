@@ -103,6 +103,15 @@ With a palette, the added and removed lines get a tinted background mixed from
 it. The file is re-read every second, so a theme change shows up while
 muxdiff is running.
 
+Inside tmux, the background the terminal reports is the one tmux saw when it
+attached. If you switch the terminal from light to dark (or back) after that,
+the tints are mixed from the old background and the text gets hard to read. If
+you switch themes, set the palette in `tmux.conf` so every pane has it:
+
+```
+set-environment -g MUXDIFF_PALETTE "$HOME/path/to/colors.toml"
+```
+
 ## Licence
 
 MIT
