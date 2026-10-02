@@ -18,7 +18,7 @@ use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Padding};
+use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph};
 use ratatui::Frame;
 
 // ---- The palette -----------------------------------------------------------
@@ -214,6 +214,53 @@ pub fn page(frame: &mut Frame, title: &str, note: &str, alert: &str, keys: &str)
     let inside = block.inner(frame.area());
     frame.render_widget(block, frame.area());
     inside
+}
+
+/// A window over the page, in the middle: a title, its lines, and keys along
+/// its foot. As wide as `width` where the terminal allows, as tall as the lines.
+pub fn modal(frame: &mut Frame, title: &str, lines: Vec<Line>, keys: &str, width: u16) {
+    let area = frame.area();
+    let width = width.min(area.width.saturating_sub(4));
+    let height = (lines.len() as u16 + 4).min(area.height.saturating_sub(2));
+    let window = Rect { x: area.x + (area.width - width) / 2, y: area.y + (area.height - height) / 2, width, height };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(colour(accent()))
+        .padding(Padding::new(2, 2, 1, 1))
+        .title_top(Line::styled(format!(" {title} "), bold().fg(accent())))
+        .title_bottom(Line::styled(format!(" {keys} "), dim()));
+    frame.render_widget(Clear, window);
+    frame.render_widget(Paragraph::new(lines).block(block), window);
+}
+
+/// Text in lines no wider than `width`, broken between words where it can.
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut out = vec![];
+    for paragraph in text.lines() {
+        let mut line = String::new();
+        for word in paragraph.split(' ') {
+            let mut word = word.to_string();
+            // a word too long for a line is cut
+            while word.chars().count() > width {
+                if !line.is_empty() {
+                    out.push(std::mem::take(&mut line));
+                }
+                out.push(word.chars().take(width).collect());
+                word = word.chars().skip(width).collect();
+            }
+            if line.is_empty() {
+                line = word;
+            } else if line.chars().count() + 1 + word.chars().count() <= width {
+                line.push(' ');
+                line.push_str(&word);
+            } else {
+                out.push(std::mem::replace(&mut line, word));
+            }
+        }
+        out.push(line);
+    }
+    out
 }
 
 /// Text with escape codes in it (bat's colours) as text ratatui can draw.

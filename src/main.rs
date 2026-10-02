@@ -23,8 +23,10 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use ratatui::Frame;
 mod ui;
 use ui::*;
@@ -389,6 +391,7 @@ struct Comment {
     path: String,
     lines: Option<((&'static str, usize), (&'static str, usize))>, // first and last, by side and number; None: the file
     label: String,                      // "src/main.rs:12-15", to show
+    quote: Vec<(char, String)>,         // the lines, to show while the comment is written
 }
 
 /// Post a review comment on the pull request.
@@ -445,6 +448,70 @@ fn add_to_review(root: &str, review: &Review, comment: &Comment, body: &str) -> 
 fn submit_review(root: &str, review: &Review, verdict: &str, body: &str) -> Result<(), String> {
     let query = "mutation($review: ID!, $event: PullRequestReviewEvent!, $body: String) { submitPullRequestReview(input: { pullRequestReviewId: $review, event: $event, body: $body }) { pullRequestReview { state } } }";
     graphql(root, query, &[("review", review.id.clone()), ("event", verdict.into()), ("body", body.to_string())], ".data.submitPullRequestReview.pullRequestReview.state").map(|_| ())
+}
+
+/// A conversation on the pull request: where it is, and what was said.
+struct Thread {
+    path: String,
+    side: &'static str,
+    line: Option<usize>,  // its last line; None on a whole file, or when the code under it has gone
+    start: Option<usize>, // its first, when it spans several
+    resolved: bool,
+    outdated: bool,
+    comments: Vec<Said>,
+}
+
+struct Said {
+    author: String,
+    body: String,
+    pending: bool, // in a review not yet submitted
+}
+
+impl Thread {
+    fn pending(&self) -> bool {
+        self.comments.iter().any(|said| said.pending)
+    }
+
+    /// Its marker's colour: yellow while pending, dim once settled, else the accent.
+    fn style(&self) -> Style {
+        if self.pending() {
+            colour(theme("yellow", Color::Yellow))
+        } else if self.resolved || self.outdated {
+            dim()
+        } else {
+            colour(accent())
+        }
+    }
+
+    /// Whether it is on this line of the file, on this side.
+    fn covers(&self, path: &str, side: &str, number: usize) -> bool {
+        let Some(last) = self.line.filter(|_| !self.outdated) else { return false };
+        self.path == path && self.side == side && (self.start.unwrap_or(last).min(last)..=last).contains(&number)
+    }
+}
+
+/// Every review thread on the pull request, your pending ones too.
+fn review_threads(root: &str, pr_id: &str) -> Option<Vec<Thread>> {
+    let query = "query($id: ID!) { node(id: $id) { ... on PullRequest { reviewThreads(first: 100) { nodes { \
+        path line startLine diffSide isResolved isOutdated subjectType comments(first: 50) { nodes { author { login } body state } } } } } } }";
+    let out = graphql(root, query, &[("id", pr_id.to_string())], ".data.node.reviewThreads.nodes").ok()?;
+    let nodes: serde_json::Value = serde_json::from_str(&out).ok()?;
+    Some(nodes.as_array()?.iter().map(|node| {
+        let number = |key: &str| node[key].as_u64().map(|n| n as usize);
+        Thread {
+            path: node["path"].as_str().unwrap_or_default().to_string(),
+            side: if node["diffSide"] == "LEFT" { "LEFT" } else { "RIGHT" },
+            line: if node["subjectType"] == "FILE" { None } else { number("line") },
+            start: number("startLine"),
+            resolved: node["isResolved"].as_bool().unwrap_or(false),
+            outdated: node["isOutdated"].as_bool().unwrap_or(false),
+            comments: node["comments"]["nodes"].as_array().into_iter().flatten().map(|said| Said {
+                author: said["author"]["login"].as_str().unwrap_or("ghost").to_string(),
+                body: said["body"].as_str().unwrap_or_default().to_string(),
+                pending: said["state"] == "PENDING",
+            }).collect(),
+        }
+    }).collect())
 }
 
 // ---- Searching -------------------------------------------------------------
@@ -510,6 +577,11 @@ struct Muxdiff {
     matches_shown: bool,  // the search's matches highlighted (Esc hides them, n and N show them again)
     pr: Option<Pr>,
     looking_for_pr: Option<JoinHandle<Option<Pr>>>,
+    threads: Vec<Thread>, // the pull request's conversations
+    loading_threads: Option<JoinHandle<Option<Vec<Thread>>>>,
+    drift: Option<String>, // why the threads' line numbers may not be this checkout's
+    sidebar: bool,        // #: the threads down the side
+    help: bool,           // ?: every key, in a window
 }
 
 impl Muxdiff {
@@ -555,6 +627,18 @@ impl Muxdiff {
         let added_tint = mix(background, theme("green", Color::Rgb(0x3f, 0xb9, 0x50)), 18);
         let removed_tint = mix(background, theme("red", Color::Rgb(0xf8, 0x51, 0x49)), 18);
         let divider = mix(background, theme("foreground", Color::Reset), 10); // a band behind each hunk's "@@" line
+        // the threads' lines, by file, side and number: ● on a thread's last line, │ down the rest
+        let mut marks: HashMap<(&str, &str, usize), (&str, Style)> = HashMap::new();
+        for thread in &self.threads {
+            let Some(last) = thread.line.filter(|_| !thread.outdated) else { continue };
+            for number in thread.start.unwrap_or(last).min(last)..=last {
+                let mark = if number == last { "●" } else { "│" };
+                let entry = marks.entry((thread.path.as_str(), thread.side, number)).or_insert((mark, thread.style()));
+                if number == last {
+                    *entry = (mark, thread.style());
+                }
+            }
+        }
         let mut rows = vec![];
         let mut lines = vec![];
         for (f, file) in self.files.iter().enumerate() {
@@ -568,10 +652,14 @@ impl Muxdiff {
                 header.push(Span::styled(format!("{}  ", file.status), dim()));
             }
             if file.added > 0 {
-                header.push(Span::styled(format!("+{} ", file.added), colour(green())));
+                header.push(Span::styled(format!("+{}", file.added), colour(green())));
             }
             if file.removed > 0 {
-                header.push(Span::styled(format!("-{}", file.removed), colour(red())));
+                header.push(Span::styled(format!("{}-{}", if file.added > 0 { " " } else { "" }, file.removed), colour(red())));
+            }
+            let threads: Vec<&Thread> = self.threads.iter().filter(|thread| thread.path == file.path).collect();
+            if let Some(first) = threads.iter().find(|thread| thread.pending()).or(threads.first()) {
+                header.push(Span::styled(format!("  ● {}", threads.len()), first.style()));
             }
             rows.push(Row::Header(f));
             lines.push(Line::from(header));
@@ -589,11 +677,13 @@ impl Muxdiff {
                 lines.push(Line::styled(format!("        {}", hunk.header), band));
                 for (l, line) in hunk.lines.iter().enumerate() {
                     let (gutter, style, tint, coloured) = match line.kind {
-                        '+' => (format!("{:>5}", line.number), colour(green()), added_tint, now.and_then(|lines| lines.get(line.number - 1))),
+                        '+' => (format!("{:>4} ", line.number), colour(green()), added_tint, now.and_then(|lines| lines.get(line.number - 1))),
                         '-' => ("     ".to_string(), colour(red()), removed_tint, before.and_then(|lines| lines.get(line.old_number - 1))),
-                        _ => (format!("{:>5}", line.number), Style::new(), None, now.and_then(|lines| lines.get(line.number - 1))),
+                        _ => (format!("{:>4} ", line.number), Style::new(), None, now.and_then(|lines| lines.get(line.number - 1))),
                     };
-                    let mut spans = vec![Span::styled(gutter, dim()), Span::styled(format!(" {} ", line.kind), style)];
+                    let (side, number) = side(line);
+                    let (mark, mark_style) = marks.get(&(file.path.as_str(), side, number)).copied().unwrap_or((" ", Style::new()));
+                    let mut spans = vec![Span::styled(gutter, dim()), Span::styled(mark, mark_style), Span::styled(format!("{} ", line.kind), style)];
                     match coloured {
                         // bat resets the background behind its text; the row's tint goes there too
                         Some(syntax) => spans.extend(syntax.spans.iter().cloned().map(|mut span| { span.style.bg = tint; span })),
@@ -937,7 +1027,11 @@ impl Muxdiff {
                 Some((side(first), side(last)))
             }
         };
-        Ok(Comment { pr: pr.number, pr_id: pr.id, head: pr.head, review: pr.review, path: file.path.clone(), lines, label })
+        let quote = match picked {
+            Picked::File(_) => vec![],
+            Picked::Lines(_, lines) => lines.iter().map(|&(h, l)| (file.hunks[h].lines[l].kind, file.hunks[h].lines[l].text.clone())).collect(),
+        };
+        Ok(Comment { pr: pr.number, pr_id: pr.id, head: pr.head, review: pr.review, path: file.path.clone(), lines, label, quote })
     }
 
     /// Enter on a comment: into the review in progress, if there is one;
@@ -978,7 +1072,10 @@ impl Muxdiff {
 
     fn post_comment(&mut self, comment: Comment, body: String) {
         self.note = match post(&self.root, &comment, body.trim()) {
-            Ok(()) => format!("commented on #{} at {}", comment.pr, comment.label),
+            Ok(()) => {
+                self.load_threads();
+                format!("commented on #{} at {}", comment.pr, comment.label)
+            }
             Err(error) => format!("could not comment: {error}"),
         };
         self.anchor = None;
@@ -999,6 +1096,7 @@ impl Muxdiff {
             return;
         }
         review.comments += 1;
+        self.load_threads();
         self.note = format!("{} in your review of #{} ({} so far) · S submits it", comment.label, comment.pr, review.comments);
         if let Some(pr) = self.pr.as_mut().filter(|pr| pr.number == comment.pr) {
             pr.review = Some(review);
@@ -1027,6 +1125,153 @@ impl Muxdiff {
             }
             Err(error) => format!("could not submit the review: {error}"),
         };
+        self.load_threads();
+    }
+
+    /// Read the pull request's threads again, in the background.
+    fn load_threads(&mut self) {
+        let Some(pr) = &self.pr else { return };
+        let (root, id) = (self.root.clone(), pr.id.clone());
+        self.loading_threads = Some(std::thread::spawn(move || review_threads(&root, &id)));
+    }
+
+    /// Where the cursor is, as a thread would be: the file, and the side and
+    /// number of the line (none on a header).
+    fn cursor_line(&self) -> Option<(&str, Option<(&'static str, usize)>)> {
+        match *self.rows.get(self.menu.selected()?)? {
+            Row::Header(f) | Row::Hunk(f, _) => Some((&self.files[f].path, None)),
+            Row::Text(f, h, l) => Some((&self.files[f].path, Some(side(&self.files[f].hunks[h].lines[l])))),
+            Row::Note => None,
+        }
+    }
+
+    /// #: the pull request's threads in the diff's order, the one under the
+    /// cursor scrolled into view.
+    fn draw_sidebar(&self, frame: &mut Frame, area: Rect, number: u64) {
+        let open = self.threads.iter().filter(|thread| !thread.resolved).count();
+        let block = Block::new()
+            .borders(Borders::LEFT)
+            .border_style(dim())
+            .padding(Padding::new(2, 1, 0, 0))
+            .title(Line::from(vec![Span::styled(format!(" #{number} "), bold().fg(accent())), Span::styled(format!("{open} open, {} in all ", self.threads.len()), dim())]));
+        let inside = block.inner(area);
+        frame.render_widget(block, area);
+        let width = inside.width as usize;
+        let here = self.cursor_line();
+        let mut lines: Vec<Line> = vec![];
+        if let Some(drift) = &self.drift {
+            lines.extend(wrap(&format!("Lines may be off: {drift}"), width).into_iter().map(|text| Line::styled(text, colour(theme("yellow", Color::Yellow)))));
+            lines.push(Line::raw(""));
+        }
+        let mut threads: Vec<&Thread> = self.threads.iter().collect();
+        threads.sort_by_key(|thread| (self.files.iter().position(|file| file.path == thread.path).unwrap_or(usize::MAX), thread.path.clone(), thread.line.unwrap_or(0)));
+        let mut focus = None;
+        for thread in threads {
+            let shown = self.shown(&thread.path);
+            let at = match (thread.start, thread.line) {
+                (Some(start), Some(last)) if start != last => format!("{shown}:{start}-{last}"),
+                (_, Some(last)) => format!("{shown}:{last}"),
+                _ => shown,
+            };
+            let current = match here {
+                Some((path, Some((side, number)))) => thread.covers(path, side, number),
+                Some((path, None)) => thread.path == path && focus.is_none(),
+                None => false,
+            };
+            if current && focus.is_none() {
+                focus = Some(lines.len());
+            }
+            let settled = thread.resolved || thread.outdated;
+            let mut head = vec![
+                Span::styled(if current { "▶ " } else { "● " }, thread.style()),
+                Span::styled(at, if current { bold().fg(accent()) } else { bold() }),
+            ];
+            if thread.resolved {
+                head.push(Span::styled("  resolved", dim()));
+            } else if thread.outdated {
+                head.push(Span::styled("  outdated", dim()));
+            }
+            lines.push(Line::from(head));
+            for said in &thread.comments {
+                let mut who = vec![Span::styled(format!("  {}", said.author), if settled { dim() } else { colour(accent()) })];
+                if said.pending {
+                    who.push(Span::styled("  pending", colour(theme("yellow", Color::Yellow))));
+                }
+                lines.push(Line::from(who));
+                for text in wrap(&said.body, width.saturating_sub(2)) {
+                    lines.push(Line::styled(format!("  {text}"), if settled { dim() } else { Style::new() }));
+                }
+            }
+            lines.push(Line::raw(""));
+        }
+        if self.threads.is_empty() {
+            let empty = if self.loading_threads.is_some() { "Reading the comments…" } else { "No comments yet. i comments on the selection." };
+            lines.push(Line::styled(empty, dim()));
+        }
+        let scroll = focus.unwrap_or(0).saturating_sub(1) as u16;
+        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inside);
+    }
+
+    /// The window a comment is written in: the lines it is on, what was said
+    /// on them already, and the comment.
+    fn draw_comment(&self, frame: &mut Frame) {
+        let width: u16 = 88;
+        let inside = (width as usize).min(frame.area().width as usize).saturating_sub(10);
+        let yellow = colour(theme("yellow", Color::Yellow));
+        let typed = |text: &str, editing: bool, empty: &str| -> Vec<Line<'static>> {
+            if text.is_empty() {
+                return vec![Line::from(vec![Span::styled(if editing { "▏" } else { "" }, colour(accent())), Span::styled(empty.to_string(), dim())])];
+            }
+            let mut lines: Vec<Line> = wrap(text, inside).into_iter().map(Line::raw).collect();
+            if editing {
+                if let Some(last) = lines.last_mut() {
+                    last.spans.push(Span::styled("▏", colour(accent())));
+                }
+            }
+            lines
+        };
+        let (title, mut lines, keys) = match &self.typing {
+            Some((Typing::Comment(comment), text)) | Some((Typing::Post(comment, text), _)) => {
+                let editing = matches!(self.typing, Some((Typing::Comment(_), _)));
+                let mut lines = vec![Line::styled(comment.label.clone(), bold())];
+                for (kind, text) in comment.quote.iter().take(6) {
+                    let style = match kind { '+' => colour(green()), '-' => colour(red()), _ => dim() };
+                    lines.push(Line::from(vec![Span::styled(format!("{kind} "), style), Span::styled(text.chars().take(inside - 2).collect::<String>(), dim())]));
+                }
+                if comment.quote.len() > 6 {
+                    lines.push(Line::styled(format!("  … and {} more", comment.quote.len() - 6), dim()));
+                }
+                // what was said on these lines already
+                let on_these: Vec<&Thread> = self.threads.iter().filter(|thread| match comment.lines {
+                    Some(((_, first), (side, last))) => (first.min(last)..=last).any(|number| thread.covers(&comment.path, side, number)),
+                    None => thread.path == comment.path && thread.line.is_none(),
+                }).collect();
+                for said in on_these.iter().flat_map(|thread| &thread.comments).take(4) {
+                    lines.push(Line::raw(""));
+                    lines.push(Line::from(vec![Span::styled(said.author.clone(), colour(accent())), Span::styled(if said.pending { "  pending" } else { "" }, yellow)]));
+                    lines.extend(wrap(&said.body, inside).into_iter().take(4).map(|text| Line::styled(text, dim())));
+                }
+                lines.push(Line::raw(""));
+                lines.extend(typed(text, editing, "Write a comment…"));
+                let keys = match (&self.typing, &comment.review) {
+                    (Some((Typing::Post(..), _)), _) => "c post it now · r start a review with it · Esc cancel",
+                    (_, Some(_)) => "Enter add to your review · Alt+Enter new line · Esc cancel",
+                    (_, None) => "Enter done · Alt+Enter new line · Esc cancel",
+                };
+                (format!("Comment on #{}", comment.pr), lines, keys)
+            }
+            Some((Typing::Summary, text)) | Some((Typing::Verdict(text), _)) => {
+                let editing = matches!(self.typing, Some((Typing::Summary, _)));
+                let pending = self.pr.as_ref().and_then(|pr| pr.review.as_ref()).map_or(0, |review| review.comments);
+                let mut lines = vec![Line::styled(format!("{pending} {} in it", if pending == 1 { "comment" } else { "comments" }), dim()), Line::raw("")];
+                lines.extend(typed(text, editing, "A summary, if you want one…"));
+                let keys = if editing { "Enter done · Alt+Enter new line · Esc cancel" } else { "c comment · a approve · r request changes · Esc cancel" };
+                (format!("Submit your review of #{}", self.pr.as_ref().map_or(0, |pr| pr.number)), lines, keys)
+            }
+            _ => return,
+        };
+        lines.truncate(frame.area().height.saturating_sub(6) as usize);
+        modal(frame, &title, lines, keys, width);
     }
 
     /// /: start a live search from here.
@@ -1092,6 +1337,47 @@ impl Muxdiff {
     }
 }
 
+/// ?: every key, in a window.
+impl Muxdiff {
+    fn draw_help(&self, frame: &mut Frame) {
+        let mut keys: Vec<(&str, &str)> = vec![
+            ("", "Moving"),
+            ("j k  ↑ ↓", "down, up"),
+            ("gg ge G", "first line, last line"),
+            ("[ ]", "previous, next file"),
+            ("", "Selecting, as Helix does"),
+            ("x", "the line, or a hunk or file from its header; again for the next"),
+            ("v", "select mode: moving extends the selection"),
+            (";  Alt-;", "collapse the selection, flip its ends"),
+            ("/  n N", "search as you type; next, previous match"),
+            ("", "Files"),
+            ("Tab", "open or close the file; A every file"),
+            ("Enter", "edit the file at the line"),
+        ];
+        if self.in_tmux {
+            keys.extend([("p  w", "edit it in the editor beside, or a new window"), ("s", "send the selection to the AI in this tmux session")]);
+        }
+        keys.extend([("y", "copy path:line"), ("", "The pull request")]);
+        keys.extend(match &self.pr {
+            Some(_) => vec![("i", "comment on the selection"), ("S", "submit your review"), ("#", "show or hide the comments")],
+            None => vec![("", "(none open for this branch)")],
+        });
+        keys.extend([
+            ("", "Comparing"),
+            ("m", if self.base.is_some() { "the uncommitted changes" } else { "the changes since the base" }),
+            ("c C", "a commit back, a commit forward"),
+            ("R", "read it all again"),
+            ("Esc", "leave select mode, drop the selection, hide matches, close"),
+        ]);
+        let lines = keys.into_iter().map(|(key, what)| match key {
+            "" if what.starts_with('(') => Line::styled(format!("{:10}{what}", ""), dim()),
+            "" => Line::styled(what.to_string(), bold()),
+            key => Line::from(vec![Span::styled(format!("{key:10}"), colour(accent())), Span::raw(what.to_string())]),
+        }).collect();
+        modal(frame, "Keys", lines, "any key closes", 76);
+    }
+}
+
 /// Highlight what the search matches in some of a line's spans (the text,
 /// past the gutter), splitting the spans at the matches' edges.
 fn highlight_matches(line: &mut Line<'static>, spans: std::ops::Range<usize>, search: &Regex, style: Style) {
@@ -1140,6 +1426,15 @@ impl App for Muxdiff {
     fn draw(&mut self, frame: &mut Frame) {
         if let Some(lookup) = self.looking_for_pr.take_if(|lookup| lookup.is_finished()) {
             self.pr = lookup.join().ok().flatten();
+            self.load_threads();
+        }
+        if let Some(loading) = self.loading_threads.take_if(|loading| loading.is_finished()) {
+            if let Some(threads) = loading.join().ok().flatten() {
+                self.threads = threads;
+                let here = run("git", &["-C", &self.root, "rev-parse", "HEAD"]);
+                self.drift = self.pr.as_ref().filter(|pr| pr.head != here).map(|pr| self.out_of_step(pr.number, &pr.head));
+                self.list();
+            }
         }
         let span = self.span();
         let shown = self.search.as_ref().filter(|_| self.matches_shown);
@@ -1159,7 +1454,7 @@ impl App for Muxdiff {
                 for (row, line) in lines.iter_mut().enumerate() {
                     match self.rows[row] {
                         Row::Header(_) => highlight_matches(line, 1..2, search, style),
-                        Row::Text(..) => highlight_matches(line, 2..usize::MAX, search, style),
+                        Row::Text(..) => highlight_matches(line, 3..usize::MAX, search, style),
                         _ => {}
                     }
                 }
@@ -1186,31 +1481,33 @@ impl App for Muxdiff {
         if let (Some(_), Some(Picked::Lines(_, lines))) = (self.anchor, self.picked()) {
             note.push_str(&match lines.len() { 1 => " · 1 line".to_string(), n => format!(" · {n} lines") });
         }
-        let tmux = if self.in_tmux { " · p w pane, window · s AI" } else { "" };
-        let comment = match &self.pr {
-            Some(pr) if pr.review.is_some() => " · i comment · S submit",
-            Some(_) => " · i comment",
-            None => "",
-        };
         let keys = match &self.typing {
             Some((Typing::Send(pane, reference), text)) => format!("to {} in {}: › {text}▏ {reference} · Enter send · Esc cancel", pane.tool, pane.window),
-            Some((Typing::Comment(comment), text)) => format!("#{} {}: › {}▏ · Enter post · Alt+Enter new line · Esc cancel", comment.pr, comment.label, text.replace('\n', " ⏎ ")),
-            Some((Typing::Post(comment, _), _)) => format!("#{} {}: c comment now · r start a review · Esc cancel", comment.pr, comment.label),
-            Some((Typing::Summary, text)) => format!("review of #{}: › {}▏ · Enter next · Alt+Enter new line · Esc cancel", self.pr.as_ref().map_or(0, |pr| pr.number), text.replace('\n', " ⏎ ")),
-            Some((Typing::Verdict(_), _)) => "submit the review: c comment · a approve · r request changes · Esc cancel".into(),
+            Some((Typing::Comment(_) | Typing::Post(..) | Typing::Summary | Typing::Verdict(_), _)) => String::new(), // in the window
             Some((Typing::Search(_), text)) => format!("/{text}▏ · Enter keep · Esc go back"),
-            None => format!(
-                "{}x line · v extend · / search · Tab fold · Enter edit{tmux}{comment} · [ ] file · m {} · c C commit · y copy · q close",
-                if self.extending { "SEL · " } else { "" },
-                if self.base.is_some() { "uncommitted" } else { &self.branch },
-            ),
+            None => format!("{}? keys · q close", if self.extending { "SEL · " } else { "" }),
         };
         let area = page(frame, "muxdiff", &note, &self.note, &keys);
-        self.menu.draw(frame, area);
+        match self.pr.as_ref().map(|pr| pr.number).filter(|_| self.sidebar) {
+            Some(number) => {
+                let side = (area.width * 2 / 5).clamp(30, 64).min(area.width / 2);
+                let [list, threads] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(side)]).areas(area);
+                self.menu.draw(frame, list);
+                self.draw_sidebar(frame, threads, number);
+            }
+            None => self.menu.draw(frame, area),
+        }
+        self.draw_comment(frame);
+        if self.help {
+            self.draw_help(frame);
+        }
     }
 
     fn key(&mut self, key: KeyEvent) -> Flow {
         self.note.clear();
+        if std::mem::take(&mut self.help) {
+            return Flow::Go;
+        }
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         if let Some((Typing::Post(..) | Typing::Verdict(_), _)) = &self.typing {
             // a choice: one key
@@ -1281,6 +1578,9 @@ impl App for Muxdiff {
             KeyCode::Char('N') => self.find(false),
             KeyCode::Char('i') => self.start_comment(),
             KeyCode::Char('S') => self.start_submitting(),
+            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('#') if self.pr.is_some() => self.sidebar = !self.sidebar,
+            KeyCode::Char('#') => self.note = "no open pull request for this branch".into(),
             KeyCode::Tab | KeyCode::Char(' ') => self.toggle(),
             KeyCode::Char('A') => self.toggle_all(),
             KeyCode::Enter => self.edit(Where::Here),
@@ -1292,7 +1592,10 @@ impl App for Muxdiff {
             KeyCode::Char('G') => { self.before_move(); self.menu.select(last); }
             KeyCode::Char('y') => self.yank(),
             KeyCode::Char('s') => self.start_sending(),
-            KeyCode::Char('R') => self.reload(),
+            KeyCode::Char('R') => {
+                self.reload();
+                self.load_threads();
+            }
             KeyCode::Char('m') => {
                 self.base = if self.base.is_some() { None } else { Some(self.branch.clone()) };
                 self.back = 0;
@@ -1378,6 +1681,11 @@ fn main() {
         search: None,
         pr: None,
         looking_for_pr: Some(looking_for_pr),
+        threads: vec![],
+        loading_threads: None,
+        drift: None,
+        sidebar: false,
+        help: false,
     };
     app.reload();
     start(&mut app, Duration::from_secs(3));

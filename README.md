@@ -14,7 +14,8 @@ and again when the editor closes.
 
 ## Keys
 
-Moving and selecting work as they do in [Helix](https://helix-editor.com).
+Moving and selecting work as they do in [Helix](https://helix-editor.com). `?` shows
+every key in a window, so the bar along the bottom keeps to what the last key did.
 
 | Key | Does |
 |---|---|
@@ -34,10 +35,12 @@ Moving and selecting work as they do in [Helix](https://helix-editor.com).
 | `s` | Send the selection (or the line, hunk or file) to the AI agent in this tmux session, with an optional prompt |
 | `i` | Comment on the selection in the branch's pull request |
 | `S` | Submit your review of the pull request |
+| `#` | Show or hide the pull request's comments down the side |
 | `y` | Copy `path:line`, or `path:first-last` |
 | `m` | Switch between the uncommitted changes and the base: the one you gave, or the default branch |
 | `c` `C` | Go back one commit, or forward one |
 | `R` | Read the diff again |
+| `?` | Every key, in a window |
 | `q` | Close |
 
 `s` finds the agent by looking for its process in the session's panes: Claude
@@ -47,8 +50,17 @@ Amp and Goose. It pastes a reference in sidekick.nvim's format
 
 ## Pull request comments
 
-When the branch has an open pull request, its number shows in the title, and `i`
-comments on the selected lines, or on the whole file from its header. Type the
+When the branch has an open pull request, its number shows in the title, and its
+review threads show in the diff:
+
+- each file's header counts its threads
+- a commented line has a ● in the gutter (yellow while pending in your review,
+  dim once resolved), with │ down the rest of a range
+- `#` opens the threads down the side, in the diff's order, scrolled to the one
+  under the cursor
+
+`i` comments on the selected lines, or on the whole file from its header. It opens
+a window showing the lines and what's already been said on them. Type the
 comment (`Alt-Enter` for a new line) and press `Enter`. If you have a review in
 progress, the comment goes into it. Otherwise you choose:
 
