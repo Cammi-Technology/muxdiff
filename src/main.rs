@@ -19,14 +19,16 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
-use ratatui::style::{Color, Style};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 mod ui;
 use ui::*;
+use regex::Regex;
 
 // ---- Reading the diff ------------------------------------------------------
 
@@ -300,6 +302,181 @@ fn copy(text: &str) -> bool {
     ok("sh", &["-c", command, "muxdiff", text])
 }
 
+// ---- The pull request ------------------------------------------------------
+
+/// gh, run from the repo so `{owner}/{repo}` and the branch's pull request
+/// are this one's: what it printed, or the first line of its complaint.
+fn gh(root: &str, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("gh").args(args).current_dir(root).stdin(Stdio::null()).output().map_err(|_| "gh is not installed".to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    } else {
+        let error = String::from_utf8_lossy(&out.stderr);
+        Err(error.lines().find(|line| !line.trim().is_empty()).unwrap_or("gh failed").trim().to_string())
+    }
+}
+
+struct Pr {
+    number: u64,
+    id: String,             // GitHub's node id, which its GraphQL API takes
+    head: String,           // the commit the pull request is at, which a comment is made on
+    review: Option<Review>, // your review of it in progress, if there is one
+}
+
+/// A review started but not yet submitted: only its author sees it.
+#[derive(Clone)]
+struct Review {
+    id: String,
+    comments: usize,
+}
+
+/// GitHub's GraphQL API: `variables` as name=value, the line numbers as
+/// numbers and the rest as strings. What `jq` makes of the answer.
+fn graphql(root: &str, query: &str, variables: &[(&str, String)], jq: &str) -> Result<String, String> {
+    let query = format!("query={query}");
+    let fields: Vec<(&str, String)> = variables.iter()
+        .map(|(name, value)| (if matches!(*name, "line" | "startLine") { "-F" } else { "-f" }, format!("{name}={value}")))
+        .collect();
+    let mut args = vec!["api", "graphql", "-f", &query, "--jq", jq];
+    for (flag, field) in &fields {
+        args.push(flag);
+        args.push(field);
+    }
+    gh(root, &args).map(|out| out.trim().to_string())
+}
+
+/// The open pull request for the branch checked out (or the one numbered),
+/// with your review in progress.
+fn pull_request(root: &str, number: Option<u64>) -> Option<Pr> {
+    let mut args = vec!["pr", "view"];
+    let number = number.map(|n| n.to_string());
+    args.extend(number.as_deref());
+    args.extend(["--json", "id,number,headRefOid,state", "--jq", r#"select(.state == "OPEN") | "\(.number) \(.id) \(.headRefOid)""#]);
+    let out = gh(root, &args).ok()?;
+    let [number, id, head] = out.split_whitespace().collect::<Vec<_>>()[..] else { return None };
+    let query = "query($id: ID!) { node(id: $id) { ... on PullRequest { reviews(states: PENDING, first: 1) { nodes { id comments { totalCount } } } } } }";
+    let review = graphql(root, query, &[("id", id.to_string())], r#".data.node.reviews.nodes[0] // empty | "\(.id) \(.comments.totalCount)""#).ok()
+        .and_then(|out| {
+            let (id, comments) = out.split_once(' ')?;
+            Some(Review { id: id.to_string(), comments: comments.parse().ok()? })
+        });
+    Some(Pr { number: number.parse().ok()?, id: id.to_string(), head: head.to_string(), review })
+}
+
+/// Which side of the diff a line is on, as GitHub names it: a removed line
+/// by its number before, any other by its number now.
+fn side(line: &DiffLine) -> (&'static str, usize) {
+    if line.kind == '-' { ("LEFT", line.old_number) } else { ("RIGHT", line.number) }
+}
+
+/// The hunk of the pull request's diff that has this line, on this side,
+/// with the same text: a comment can only go on a line the pull request
+/// shows, and only on lines of one hunk.
+fn hunk_with(file: &File, line: &DiffLine) -> Option<usize> {
+    let (want_side, number) = side(line);
+    file.hunks.iter().position(|hunk| hunk.lines.iter().any(|theirs| {
+        let found = if want_side == "LEFT" { theirs.kind == '-' && theirs.old_number == number } else { theirs.kind != '-' && theirs.number == number };
+        found && theirs.text == line.text
+    }))
+}
+
+/// Where a comment goes: the file, and the lines (None for the whole file).
+struct Comment {
+    pr: u64,
+    pr_id: String,
+    head: String,
+    review: Option<Review>, // the review in progress it joins, if there is one
+    path: String,
+    lines: Option<((&'static str, usize), (&'static str, usize))>, // first and last, by side and number; None: the file
+    label: String,                      // "src/main.rs:12-15", to show
+}
+
+/// Post a review comment on the pull request.
+fn post(root: &str, comment: &Comment, body: &str) -> Result<(), String> {
+    let endpoint = format!("repos/{{owner}}/{{repo}}/pulls/{}/comments", comment.pr);
+    let mut fields = vec![format!("body={body}"), format!("commit_id={}", comment.head), format!("path={}", comment.path)];
+    match comment.lines {
+        None => fields.push("subject_type=file".into()),
+        Some((start, (side, line))) => {
+            fields.push(format!("side={side}"));
+            fields.push(format!("line={line}"));
+            if start != (side, line) {
+                fields.push(format!("start_side={}", start.0));
+                fields.push(format!("start_line={}", start.1));
+            }
+        }
+    }
+    let mut args = vec!["api", "--method", "POST", &endpoint];
+    for field in &fields {
+        // numbers as numbers, the rest as strings
+        args.push(if field.starts_with("line=") || field.starts_with("start_line=") { "-F" } else { "-f" });
+        args.push(field);
+    }
+    gh(root, &args).map(|_| ())
+}
+
+/// Start a review of the pull request, unsubmitted, with nothing in it yet.
+fn start_review(root: &str, comment: &Comment) -> Result<Review, String> {
+    let query = "mutation($pr: ID!, $head: GitObjectID!) { addPullRequestReview(input: { pullRequestId: $pr, commitOID: $head }) { pullRequestReview { id } } }";
+    let id = graphql(root, query, &[("pr", comment.pr_id.clone()), ("head", comment.head.clone())], ".data.addPullRequestReview.pullRequestReview.id")?;
+    Ok(Review { id, comments: 0 })
+}
+
+/// Add the comment to a review in progress.
+fn add_to_review(root: &str, review: &Review, comment: &Comment, body: &str) -> Result<(), String> {
+    let mut variables = vec![("review", review.id.clone()), ("path", comment.path.clone()), ("body", body.to_string())];
+    match comment.lines {
+        None => variables.push(("subject", "FILE".into())),
+        Some((start, (side, line))) => {
+            variables.extend([("subject", "LINE".into()), ("side", side.into()), ("line", line.to_string())]);
+            if start != (side, line) {
+                variables.extend([("startSide", start.0.into()), ("startLine", start.1.to_string())]);
+            }
+        }
+    }
+    let query = "mutation($review: ID!, $path: String!, $body: String!, $subject: PullRequestReviewThreadSubjectType, $line: Int, $side: DiffSide, $startLine: Int, $startSide: DiffSide) { \
+        addPullRequestReviewThread(input: { pullRequestReviewId: $review, path: $path, body: $body, subjectType: $subject, line: $line, side: $side, startLine: $startLine, startSide: $startSide }) { thread { id } } }";
+    graphql(root, query, &variables, ".data.addPullRequestReviewThread.thread.id").and_then(|id| {
+        if id.is_empty() || id == "null" { Err("GitHub did not take the comment".into()) } else { Ok(()) }
+    })
+}
+
+/// Submit the review in progress: COMMENT, APPROVE or REQUEST_CHANGES.
+fn submit_review(root: &str, review: &Review, verdict: &str, body: &str) -> Result<(), String> {
+    let query = "mutation($review: ID!, $event: PullRequestReviewEvent!, $body: String) { submitPullRequestReview(input: { pullRequestReviewId: $review, event: $event, body: $body }) { pullRequestReview { state } } }";
+    graphql(root, query, &[("review", review.id.clone()), ("event", verdict.into()), ("body", body.to_string())], ".data.submitPullRequestReview.pullRequestReview.state").map(|_| ())
+}
+
+// ---- Searching -------------------------------------------------------------
+
+/// A search as Helix does it: a regex, ignoring case unless it has a capital.
+fn search_for(pattern: &str) -> Result<Regex, regex::Error> {
+    let smart = if pattern.chars().any(char::is_uppercase) { "" } else { "(?i)" };
+    Regex::new(&format!("{smart}{pattern}"))
+}
+
+/// Where a row is, in an order that holds whether files are open or not:
+/// file, then hunk, then line. A header is 0 within its file, a hunk's "@@"
+/// line 0 within its hunk.
+type Place = (usize, usize, usize);
+
+// ---- The page, with selection ------------------------------------------------
+
+enum Typing {
+    Send(Pane, String),    // s: the AI's pane, the reference
+    Comment(Comment),      // i: where the comment goes
+    Post(Comment, String), // the comment typed, with no review in progress: post it, or start one?
+    Summary,               // S: the review's summary
+    Verdict(String),       // and then: comment, approve or request changes?
+    Search,                // /
+}
+
+/// What the keys act on: the selection, or else the row under the cursor.
+enum Picked {
+    File(usize),
+    Lines(usize, Vec<(usize, usize)>), // the file, and (hunk, line) of each line
+}
+
 struct Muxdiff {
     root: String,
     cwd: PathBuf,
@@ -311,10 +488,18 @@ struct Muxdiff {
     files: Vec<File>,
     open: Vec<String>,    // the paths whose diffs are shown
     rows: Vec<Row>,
+    lines: Vec<Line<'static>>, // the rows as drawn, before the selection is marked on them
+    marked: Option<(usize, usize)>, // the rows the menu has marked as selected
     menu: Menu,
     in_tmux: bool,
     note: String,         // a word about the last thing done, after the title
-    sending: Option<(Pane, String, String)>, // s pressed: the AI pane, the reference, the prompt being typed
+    typing: Option<(Typing, String)>, // a prompt, comment or search being typed
+    anchor: Option<usize>, // the selection's other end (the cursor is one end), as Helix keeps it
+    extending: bool,      // v: select mode, where moving extends the selection
+    g: bool,              // g pressed, waiting for the second key of gg or ge
+    search: Option<(String, Regex)>, // what was typed, and the search made of it
+    pr: Option<Pr>,
+    looking_for_pr: Option<JoinHandle<Option<Pr>>>,
 }
 
 impl Muxdiff {
@@ -418,8 +603,15 @@ impl Muxdiff {
             rows.push(Row::Note);
             lines.push(Line::styled("No changes", dim()));
         }
+        if rows.len() != self.rows.len() {
+            // the rows moved under the selection
+            self.anchor = None;
+            self.extending = false;
+        }
         self.rows = rows;
-        self.menu.set(lines);
+        self.lines = lines;
+        self.marked = None;
+        self.menu.set(self.lines.clone());
     }
 
     /// The file under the cursor, and the line to open it at.
@@ -492,30 +684,170 @@ impl Muxdiff {
         self.note = format!("{path}:{line}");
     }
 
-    /// What the row under the cursor is, for the AI: the file, the hunk's
-    /// lines or the one line, as sidekick.nvim writes a location, with the
-    /// path as the AI's pane sees it.
-    fn reference(&self, from: &Path) -> Option<String> {
-        let row = *self.rows.get(self.menu.selected()?)?;
-        let (file, lines) = match row {
-            Row::Header(f) => (&self.files[f], None),
-            Row::Hunk(f, h) => {
-                let hunk = &self.files[f].hunks[h];
-                let last = hunk.lines.iter().filter(|line| line.kind != '-').map(|line| line.number).max().unwrap_or(hunk.start);
-                (&self.files[f], Some((hunk.start, last)))
-            }
-            Row::Text(f, h, l) => {
-                let line = &self.files[f].hunks[h].lines[l];
-                (&self.files[f], Some((line.number, line.number)))
-            }
+    // ---- Selecting, as Helix does --------------------------------------------
+
+    fn file_of(&self, row: usize) -> Option<usize> {
+        match *self.rows.get(row)? {
+            Row::Header(f) | Row::Hunk(f, _) | Row::Text(f, _, _) => Some(f),
+            Row::Note => None,
+        }
+    }
+
+    /// The selection's first and last rows, when there is one.
+    fn span(&self) -> Option<(usize, usize)> {
+        let (anchor, cursor) = (self.anchor?, self.menu.selected()?);
+        Some((anchor.min(cursor), anchor.max(cursor)))
+    }
+
+    /// The file the selection is in: the anchor's, since a selection keeps to
+    /// one file, or else the cursor's.
+    fn selected_file(&self) -> Option<usize> {
+        self.anchor.and_then(|anchor| self.file_of(anchor)).or_else(|| self.file_of(self.menu.selected()?))
+    }
+
+    /// What the keys act on: the selected lines, or else the line, hunk or
+    /// file under the cursor.
+    fn picked(&self) -> Option<Picked> {
+        let cursor = self.menu.selected()?;
+        if let Some((first, last)) = self.span() {
+            let f = self.selected_file()?;
+            let lines: Vec<_> = (first..=last).filter_map(|row| match self.rows[row] {
+                Row::Text(rf, h, l) if rf == f => Some((h, l)),
+                _ => None,
+            }).collect();
+            return Some(if lines.is_empty() { Picked::File(f) } else { Picked::Lines(f, lines) });
+        }
+        Some(match self.rows[cursor] {
+            Row::Header(f) => Picked::File(f),
+            Row::Hunk(f, h) => Picked::Lines(f, (0..self.files[f].hunks[h].lines.len()).map(|l| (h, l)).collect()),
+            Row::Text(f, h, l) => Picked::Lines(f, vec![(h, l)]),
             Row::Note => return None,
+        })
+    }
+
+    /// The picked lines' first and last numbers in the file now (a removed
+    /// line's, where it was), or None for a whole file.
+    fn picked_range(&self, picked: &Picked) -> Option<(usize, usize)> {
+        let Picked::Lines(f, lines) = picked else { return None };
+        let all: Vec<&DiffLine> = lines.iter().map(|&(h, l)| &self.files[*f].hunks[h].lines[l]).collect();
+        let kept: Vec<usize> = all.iter().filter(|line| line.kind != '-').map(|line| line.number).collect();
+        let numbers = if kept.is_empty() { all.iter().map(|line| line.number).collect() } else { kept };
+        Some((*numbers.iter().min()?, *numbers.iter().max()?))
+    }
+
+    /// Before a move: in select mode the selection grows from where the
+    /// cursor was; otherwise it goes.
+    fn before_move(&mut self) {
+        self.anchor = if self.extending { self.anchor.or(self.menu.selected()) } else { None };
+    }
+
+    /// x: select the line, or the hunk or file under the cursor; again, take
+    /// in the file's next line too.
+    fn select_line(&mut self) {
+        let Some(cursor) = self.menu.selected() else { return };
+        let Some(f) = self.file_of(cursor) else { return };
+        if self.anchor.is_some_and(|anchor| anchor <= cursor && self.file_of(anchor) == Some(f)) {
+            let next = (cursor + 1..self.rows.len())
+                .take_while(|&row| self.file_of(row) == Some(f))
+                .find(|&row| matches!(self.rows[row], Row::Text(..)));
+            if let Some(row) = next {
+                self.menu.select(row);
+            }
+            return;
+        }
+        let end = match self.rows[cursor] {
+            Row::Hunk(_, h) => (cursor..self.rows.len()).take_while(|&row| matches!(self.rows[row], Row::Hunk(rf, rh) | Row::Text(rf, rh, _) if rf == f && rh == h)).last(),
+            Row::Header(_) => (cursor..self.rows.len()).take_while(|&row| self.file_of(row) == Some(f)).last(),
+            _ => None,
         };
-        let path = relative(from, &Path::new(&self.root).join(&file.path)).to_string_lossy().to_string();
-        Some(match lines {
+        self.anchor = Some(cursor);
+        if let Some(row) = end {
+            self.menu.select(row);
+        }
+    }
+
+    // ---- Searching ---------------------------------------------------------
+
+    /// Where a row is, for searching: None for a blank one.
+    fn place(&self, row: usize) -> Option<Place> {
+        match *self.rows.get(row)? {
+            Row::Header(f) => Some((f, 0, 0)),
+            Row::Hunk(f, h) => Some((f, h + 1, 0)),
+            Row::Text(f, h, l) => Some((f, h + 1, l + 1)),
+            Row::Note => None,
+        }
+    }
+
+    /// n, N: the next (or previous) path or line the search matches, in the
+    /// closed files too, which open to show it.
+    fn find(&mut self, forward: bool) {
+        let Some((pattern, search)) = &self.search else {
+            self.note = "nothing searched for yet: /".into();
+            return;
+        };
+        let here = self.menu.selected()
+            .and_then(|at| (0..=at).rev().find_map(|row| self.place(row)))
+            .unwrap_or((0, 0, 0));
+        let mut found: Vec<Place> = vec![];
+        for (f, file) in self.files.iter().enumerate() {
+            if search.is_match(&file.path) {
+                found.push((f, 0, 0));
+            }
+            for (h, hunk) in file.hunks.iter().enumerate() {
+                for (l, line) in hunk.lines.iter().enumerate() {
+                    if search.is_match(&line.text) {
+                        found.push((f, h + 1, l + 1));
+                    }
+                }
+            }
+        }
+        let next = if forward {
+            found.iter().find(|&&place| place > here).or(found.first())
+        } else {
+            found.iter().rev().find(|&&place| place < here).or(found.last())
+        };
+        let Some(&place) = next else {
+            self.note = format!("no match for /{pattern}");
+            return;
+        };
+        if (forward && place <= here) || (!forward && place >= here) {
+            self.note = "search wrapped".into();
+        }
+        self.before_move();
+        let (f, h, _) = place;
+        if h > 0 && !self.open.contains(&self.files[f].path) {
+            self.open.push(self.files[f].path.clone());
+            self.list();
+        }
+        if let Some(row) = (0..self.rows.len()).find(|&row| self.place(row) == Some(place)) {
+            self.menu.select(row);
+        }
+    }
+
+    // ---- Sending, copying, commenting ----------------------------------------
+
+    /// What is picked, for the AI: the file, or the lines, as sidekick.nvim
+    /// writes a location, with the path as the AI's pane sees it.
+    fn reference(&self, from: &Path) -> Option<String> {
+        let picked = self.picked()?;
+        let f = match &picked { Picked::File(f) | Picked::Lines(f, _) => *f };
+        let path = relative(from, &Path::new(&self.root).join(&self.files[f].path)).to_string_lossy().to_string();
+        Some(match self.picked_range(&picked) {
             None => format!("@{path}"),
             Some((start, end)) if start == end => format!("@{path} :L{start}"),
             Some((start, end)) => format!("@{path} :L{start}-L{end}"),
         })
+    }
+
+    /// What is picked, for people: src/main.rs:12-15
+    fn label(&self, picked: &Picked) -> String {
+        let f = match picked { Picked::File(f) | Picked::Lines(f, _) => *f };
+        let path = self.shown(&self.files[f].path);
+        match self.picked_range(picked) {
+            None => path,
+            Some((start, end)) if start == end => format!("{path}:{start}"),
+            Some((start, end)) => format!("{path}:{start}-{end}"),
+        }
     }
 
     /// s: find the AI in this tmux session, then take a prompt to send with
@@ -532,11 +864,10 @@ impl Muxdiff {
             return;
         };
         let Some(reference) = self.reference(&pane.cwd) else { return };
-        self.sending = Some((pane, reference, String::new()));
+        self.typing = Some((Typing::Send(pane, reference), String::new()));
     }
 
-    fn send(&mut self) {
-        let Some((pane, reference, prompt)) = self.sending.take() else { return };
+    fn send(&mut self, pane: Pane, reference: String, prompt: String) {
         let text = if prompt.trim().is_empty() { reference } else { format!("{} {reference}", prompt.trim()) };
         self.note = if send_to_pane(&pane.id, &text) {
             format!("sent to {} in {}", pane.tool, pane.window)
@@ -546,18 +877,181 @@ impl Muxdiff {
     }
 
     fn yank(&mut self) {
-        let Some((file, line)) = self.at() else { return };
-        let reference = format!("{}:{line}", self.shown(&file.path));
+        let Some(picked) = self.picked() else { return };
+        let reference = self.label(&picked);
         if !copy(&reference) {
             self.note = "no clipboard: wl-copy, pbcopy or xclip".into();
             return;
         }
         self.note = format!("copied {reference}");
     }
+
+    /// i: check the picked lines are in the pull request's diff, then take
+    /// the comment (Enter posts, Esc cancels).
+    fn start_comment(&mut self) {
+        let Some(number) = self.pr.as_ref().map(|pr| pr.number) else {
+            self.note = if self.looking_for_pr.is_some() { "still looking for a pull request".into() } else { "no open pull request for this branch".into() };
+            return;
+        };
+        let Some(picked) = self.picked() else { return };
+        match self.comment_on(number, &picked) {
+            Ok(comment) => self.typing = Some((Typing::Comment(comment), String::new())),
+            Err(error) => self.note = error,
+        }
+    }
+
+    /// Where a comment on the picked lines goes. GitHub only takes one on
+    /// lines the pull request's diff shows, all in one hunk, so they are
+    /// checked against it, text and all: a line not yet committed or pushed
+    /// is turned away here rather than landing on the wrong line.
+    fn comment_on(&self, number: u64, picked: &Picked) -> Result<Comment, String> {
+        // the pull request as it is now: it may have moved on since muxdiff started
+        let pr = pull_request(&self.root, Some(number)).ok_or(format!("#{number} is closed, or gh can't see it"))?;
+        let theirs = parse(&gh(&self.root, &["pr", "diff", &number.to_string(), "--color=never"])?);
+        let label = self.label(picked);
+        let not_in = format!("{label} is not in #{number}'s diff: commit and push it first");
+        let f = match picked { Picked::File(f) | Picked::Lines(f, _) => *f };
+        let file = &self.files[f];
+        let their_file = theirs.iter().find(|theirs| theirs.path == file.path).ok_or(not_in.clone())?;
+        let lines = match picked {
+            Picked::File(_) => None,
+            Picked::Lines(_, lines) => {
+                let line = |&(h, l): &(usize, usize)| &file.hunks[h].lines[l];
+                let (Some(first), Some(last)) = (lines.first().map(line), lines.last().map(line)) else { return Err(not_in) };
+                let (Some(a), Some(b)) = (hunk_with(their_file, first), hunk_with(their_file, last)) else { return Err(not_in) };
+                if a != b {
+                    return Err(format!("{label} spans two of #{number}'s hunks: a comment's lines must be in one"));
+                }
+                Some((side(first), side(last)))
+            }
+        };
+        Ok(Comment { pr: pr.number, pr_id: pr.id, head: pr.head, review: pr.review, path: file.path.clone(), lines, label })
+    }
+
+    /// Enter on a comment: into the review in progress, if there is one;
+    /// otherwise ask whether to post it now or start a review with it.
+    fn comment_typed(&mut self, comment: Comment, body: String) {
+        if body.trim().is_empty() {
+            self.note = "nothing to post".into();
+            return;
+        }
+        match comment.review.clone() {
+            Some(review) => self.review_comment(comment, review, body),
+            None => self.typing = Some((Typing::Post(comment, body), String::new())),
+        }
+    }
+
+    /// c, after a comment: post it on its own.
+    fn post_comment(&mut self, comment: Comment, body: String) {
+        self.note = match post(&self.root, &comment, body.trim()) {
+            Ok(()) => format!("commented on #{} at {}", comment.pr, comment.label),
+            Err(error) => format!("could not comment: {error}"),
+        };
+        self.anchor = None;
+        self.extending = false;
+    }
+
+    /// r, after a comment: start a review with it.
+    fn start_review_with(&mut self, comment: Comment, body: String) {
+        match start_review(&self.root, &comment) {
+            Ok(review) => self.review_comment(comment, review, body),
+            Err(error) => self.note = format!("could not start a review: {error}"),
+        }
+    }
+
+    fn review_comment(&mut self, comment: Comment, mut review: Review, body: String) {
+        if let Err(error) = add_to_review(&self.root, &review, &comment, body.trim()) {
+            self.note = format!("could not add to the review: {error}");
+            return;
+        }
+        review.comments += 1;
+        self.note = format!("{} in your review of #{} ({} so far) · S submits it", comment.label, comment.pr, review.comments);
+        if let Some(pr) = self.pr.as_mut().filter(|pr| pr.number == comment.pr) {
+            pr.review = Some(review);
+        }
+        self.anchor = None;
+        self.extending = false;
+    }
+
+    /// S: submit the review in progress, after a summary and a verdict.
+    fn start_submitting(&mut self) {
+        match self.pr.as_ref().map(|pr| pr.review.is_some()) {
+            Some(true) => self.typing = Some((Typing::Summary, String::new())),
+            Some(false) => self.note = "no review in progress: i, then r, starts one".into(),
+            None => self.note = "no open pull request for this branch".into(),
+        }
+    }
+
+    fn submit(&mut self, verdict: &str, summary: String) {
+        let Some(pr) = self.pr.as_mut() else { return };
+        let Some(review) = pr.review.clone() else { return };
+        self.note = match submit_review(&self.root, &review, verdict, summary.trim()) {
+            Ok(()) => {
+                pr.review = None;
+                let done = match verdict { "APPROVE" => "approved", "REQUEST_CHANGES" => "requested changes on", _ => "reviewed" };
+                format!("{done} #{}", pr.number)
+            }
+            Err(error) => format!("could not submit the review: {error}"),
+        };
+    }
+
+    /// Enter, after typing.
+    fn finish(&mut self, typing: Typing, text: String) {
+        match typing {
+            Typing::Send(pane, reference) => self.send(pane, reference, text),
+            Typing::Comment(comment) => self.comment_typed(comment, text),
+            Typing::Summary => self.typing = Some((Typing::Verdict(text), String::new())),
+            Typing::Post(..) | Typing::Verdict(_) => {} // a key chooses, not Enter
+            Typing::Search => {
+                // an empty search searches again for the last
+                let pattern = match (text.is_empty(), &self.search) {
+                    (true, Some((last, _))) => last.clone(),
+                    (true, None) => return,
+                    (false, _) => text,
+                };
+                match search_for(&pattern) {
+                    Ok(search) => {
+                        self.search = Some((pattern, search));
+                        self.find(true);
+                    }
+                    Err(_) => self.note = format!("not a regex: {pattern}"),
+                }
+            }
+        }
+    }
+}
+
+/// Show a row as selected: the palette's selection colour behind it, or
+/// reversed without one.
+fn mark(line: &mut Line<'static>, bg: Option<Color>) {
+    match bg {
+        Some(bg) => {
+            line.style = line.style.bg(bg);
+            for span in &mut line.spans {
+                span.style.bg = Some(bg);
+            }
+        }
+        None => line.style = line.style.add_modifier(Modifier::REVERSED),
+    }
 }
 
 impl App for Muxdiff {
     fn draw(&mut self, frame: &mut Frame) {
+        if let Some(lookup) = self.looking_for_pr.take_if(|lookup| lookup.is_finished()) {
+            self.pr = lookup.join().ok().flatten();
+        }
+        let span = self.span();
+        if span != self.marked {
+            let mut lines = self.lines.clone();
+            if let (Some((first, last)), Some(f)) = (span, self.selected_file()) {
+                let bg = Some(theme("selection", Color::Reset)).filter(|bg| *bg != Color::Reset);
+                for row in (first..=last).filter(|&row| self.file_of(row) == Some(f)) {
+                    mark(&mut lines[row], bg);
+                }
+            }
+            self.menu.set(lines);
+            self.marked = span;
+        }
         let what = match &self.base {
             Some(base) if self.base_title.is_empty() => format!("since {base}"),
             Some(base) => format!("since {base} ({})", self.base_title.chars().take(48).collect::<String>()),
@@ -567,11 +1061,37 @@ impl App for Muxdiff {
             1 => "1 file".to_string(),
             n => format!("{n} files"),
         };
-        let note = if self.note.is_empty() { format!("{what} · {files}") } else { format!("{what} · {files} · {}", self.note) };
-        let tmux = if self.in_tmux { " · p pane · w window · s send to AI" } else { "" };
-        let keys = match &self.sending {
-            Some((pane, reference, prompt)) => format!("to {} in {}: › {prompt}▏ {reference} · Enter send · Esc cancel", pane.tool, pane.window),
-            None => format!("Tab fold · Enter edit{tmux} · [ ] file · m {} · c C a commit back, forward · y copy · q close", if self.base.is_some() { "uncommitted" } else { &self.branch }),
+        let mut note = format!("{what} · {files}");
+        if let Some(pr) = &self.pr {
+            note.push_str(&format!(" · #{}", pr.number));
+            if let Some(review) = &pr.review {
+                note.push_str(&format!(" · review in progress, {} {}", review.comments, if review.comments == 1 { "comment" } else { "comments" }));
+            }
+        }
+        if let (Some(_), Some(Picked::Lines(_, lines))) = (self.anchor, self.picked()) {
+            note.push_str(&match lines.len() { 1 => " · 1 line".to_string(), n => format!(" · {n} lines") });
+        }
+        if !self.note.is_empty() {
+            note.push_str(&format!(" · {}", self.note));
+        }
+        let tmux = if self.in_tmux { " · p w pane, window · s AI" } else { "" };
+        let comment = match &self.pr {
+            Some(pr) if pr.review.is_some() => " · i comment · S submit",
+            Some(_) => " · i comment",
+            None => "",
+        };
+        let keys = match &self.typing {
+            Some((Typing::Send(pane, reference), text)) => format!("to {} in {}: › {text}▏ {reference} · Enter send · Esc cancel", pane.tool, pane.window),
+            Some((Typing::Comment(comment), text)) => format!("#{} {}: › {}▏ · Enter post · Alt+Enter new line · Esc cancel", comment.pr, comment.label, text.replace('\n', " ⏎ ")),
+            Some((Typing::Post(comment, _), _)) => format!("#{} {}: c comment now · r start a review · Esc cancel", comment.pr, comment.label),
+            Some((Typing::Summary, text)) => format!("review of #{}: › {}▏ · Enter next · Alt+Enter new line · Esc cancel", self.pr.as_ref().map_or(0, |pr| pr.number), text.replace('\n', " ⏎ ")),
+            Some((Typing::Verdict(_), _)) => "submit the review: c comment · a approve · r request changes · Esc cancel".into(),
+            Some((Typing::Search, text)) => format!("/{text}▏ · Enter find · Esc cancel"),
+            None => format!(
+                "{}x line · v extend · / search · Tab fold · Enter edit{tmux}{comment} · [ ] file · m {} · c C commit · y copy · q close",
+                if self.extending { "SEL · " } else { "" },
+                if self.base.is_some() { "uncommitted" } else { &self.branch },
+            ),
         };
         let area = page(frame, "muxdiff", &note, &keys);
         self.menu.draw(frame, area);
@@ -579,27 +1099,74 @@ impl App for Muxdiff {
 
     fn key(&mut self, key: KeyEvent) -> Flow {
         self.note.clear();
-        if let Some((_, _, prompt)) = &mut self.sending {
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if let Some((Typing::Post(..) | Typing::Verdict(_), _)) = &self.typing {
+            // a choice: one key
+            let Some((typing, _)) = self.typing.take() else { return Flow::Go };
+            match (typing, key.code) {
+                (Typing::Post(comment, body), KeyCode::Char('c')) => self.post_comment(comment, body),
+                (Typing::Post(comment, body), KeyCode::Char('r')) => self.start_review_with(comment, body),
+                (Typing::Verdict(summary), KeyCode::Char('c')) => self.submit("COMMENT", summary),
+                (Typing::Verdict(summary), KeyCode::Char('a')) => self.submit("APPROVE", summary),
+                (Typing::Verdict(summary), KeyCode::Char('r')) => self.submit("REQUEST_CHANGES", summary),
+                (_, KeyCode::Esc) => {}
+                (typing, _) => self.typing = Some((typing, String::new())), // not one of the choices: ask again
+            }
+            return Flow::Go;
+        }
+        if let Some((typing, text)) = &mut self.typing {
             match key.code {
-                KeyCode::Esc => self.sending = None,
-                KeyCode::Enter => self.send(),
-                KeyCode::Backspace => { prompt.pop(); }
-                KeyCode::Char(c) => prompt.push(c),
+                KeyCode::Esc => self.typing = None,
+                KeyCode::Enter if alt && matches!(typing, Typing::Comment(_) | Typing::Summary) => text.push('\n'),
+                KeyCode::Enter => {
+                    if let Some((typing, text)) = self.typing.take() {
+                        self.finish(typing, text);
+                    }
+                }
+                KeyCode::Backspace => { text.pop(); }
+                KeyCode::Char(c) => text.push(c),
+                _ => {}
+            }
+            return Flow::Go;
+        }
+        let last = self.rows.len().saturating_sub(1);
+        if std::mem::take(&mut self.g) {
+            // gg, ge
+            match key.code {
+                KeyCode::Char('g') => { self.before_move(); self.menu.select(0); }
+                KeyCode::Char('e') => { self.before_move(); self.menu.select(last); }
                 _ => {}
             }
             return Flow::Go;
         }
         match key.code {
-            _ if closes(key) => return Flow::Quit,
+            KeyCode::Esc if self.extending => self.extending = false,
+            KeyCode::Esc if self.anchor.is_some() => self.anchor = None,
+            KeyCode::Esc | KeyCode::Char('q') => return Flow::Quit,
+            KeyCode::Char('x') => self.select_line(),
+            KeyCode::Char('v') => self.extending = !self.extending,
+            KeyCode::Char(';') if alt => {
+                // flip: the cursor goes to the selection's other end
+                if let (Some(anchor), Some(cursor)) = (self.anchor, self.menu.selected()) {
+                    self.anchor = Some(cursor);
+                    self.menu.select(anchor);
+                }
+            }
+            KeyCode::Char(';') => self.anchor = None,
+            KeyCode::Char('/') => self.typing = Some((Typing::Search, String::new())),
+            KeyCode::Char('n') => self.find(true),
+            KeyCode::Char('N') => self.find(false),
+            KeyCode::Char('i') => self.start_comment(),
+            KeyCode::Char('S') => self.start_submitting(),
             KeyCode::Tab | KeyCode::Char(' ') => self.toggle(),
             KeyCode::Char('A') => self.toggle_all(),
             KeyCode::Enter => self.edit(Where::Here),
             KeyCode::Char('p') if self.in_tmux => self.edit(Where::Pane),
             KeyCode::Char('w') if self.in_tmux => self.edit(Where::Window),
-            KeyCode::Char(']') => self.jump(true),
-            KeyCode::Char('[') => self.jump(false),
-            KeyCode::Char('g') => self.menu.select(0),
-            KeyCode::Char('G') => self.menu.select(self.rows.len().saturating_sub(1)),
+            KeyCode::Char(']') => { self.before_move(); self.jump(true); }
+            KeyCode::Char('[') => { self.before_move(); self.jump(false); }
+            KeyCode::Char('g') => self.g = true,
+            KeyCode::Char('G') => { self.before_move(); self.menu.select(last); }
             KeyCode::Char('y') => self.yank(),
             KeyCode::Char('s') => self.start_sending(),
             KeyCode::Char('R') => self.reload(),
@@ -627,7 +1194,13 @@ impl App for Muxdiff {
                     self.reload();
                 }
             }
-            _ => { self.menu.key(key); }
+            _ => {
+                let anchor = self.anchor;
+                self.before_move();
+                if !self.menu.key(key) {
+                    self.anchor = anchor; // not a move after all
+                }
+            }
         }
         Flow::Go
     }
@@ -651,8 +1224,14 @@ fn main() {
         }
     }
     let cwd = std::env::current_dir().expect("the current folder");
+    let looking_for_pr = {
+        let root = root.clone();
+        std::thread::spawn(move || pull_request(&root, None))
+    };
     let mut app = Muxdiff {
-        branch: default_branch(&root),
+        // m goes back and forth between the uncommitted changes and the base
+        // given, or the default branch
+        branch: base.clone().unwrap_or_else(|| default_branch(&root)),
         root,
         cwd,
         base,
@@ -662,10 +1241,18 @@ fn main() {
         files: vec![],
         open: vec![],
         rows: vec![],
+        lines: vec![],
+        marked: None,
         menu: Menu::new(vec![]),
         in_tmux: std::env::var_os("TMUX").is_some(),
         note: String::new(),
-        sending: None,
+        typing: None,
+        anchor: None,
+        extending: false,
+        g: false,
+        search: None,
+        pr: None,
+        looking_for_pr: Some(looking_for_pr),
     };
     app.reload();
     start(&mut app, Duration::from_secs(3));

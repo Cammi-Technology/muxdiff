@@ -150,11 +150,6 @@ pub fn leave(what: impl FnOnce()) {
     REDRAW.store(true, Ordering::Relaxed);
 }
 
-/// q or Esc: the keys that close it.
-pub fn closes(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-}
-
 // ---- The frame -------------------------------------------------------------
 
 /// Draw the frame and give back the space inside it.
